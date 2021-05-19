@@ -1,22 +1,16 @@
-/**
- *  UdpSockets.java
- *  react-native-udp
- *
- *  Created by Andy Prock on 9/24/15.
- */
-
 package com.tradle.react;
 
 import android.content.Context;
 import android.net.wifi.WifiManager;
+
+import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+
 import android.util.SparseArray;
-import android.os.AsyncTask;
 
 import com.facebook.common.logging.FLog;
 import com.facebook.react.bridge.Arguments;
 import com.facebook.react.bridge.Callback;
-import com.facebook.react.bridge.GuardedAsyncTask;
 import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReactContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
@@ -28,57 +22,47 @@ import com.facebook.react.modules.core.DeviceEventManagerModule;
 import java.io.IOException;
 import java.net.SocketException;
 import java.net.UnknownHostException;
-import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * The NativeModule in charge of storing active {@link UdpSocketClient}s, and acting as an api layer.
  */
 public final class UdpSockets extends ReactContextBaseJavaModule
-  implements UdpSocketClient.OnDataReceivedListener, UdpSocketClient.OnRuntimeExceptionListener {
+        implements UdpSocketClient.OnDataReceivedListener, UdpSocketClient.OnRuntimeExceptionListener {
     private static final String TAG = "UdpSockets";
-    private WifiManager.MulticastLock mMulticastLock;
+    private static final int N_THREADS = 2;
 
-    private SparseArray<UdpSocketClient> mClients = new SparseArray<UdpSocketClient>();
-    private boolean mShuttingDown = false;
+    private WifiManager.MulticastLock mMulticastLock;
+    private final SparseArray<UdpSocketClient> mClients = new SparseArray<>();
+    private final ExecutorService executorService = Executors.newFixedThreadPool(N_THREADS);
 
     public UdpSockets(ReactApplicationContext reactContext) {
         super(reactContext);
     }
 
+    @NonNull
     @Override
     public String getName() {
         return TAG;
     }
 
     @Override
-    public void initialize() {
-        mShuttingDown = false;
-    }
-
-    @Override
     public void onCatalystInstanceDestroy() {
-        mShuttingDown = true;
-
-        // serialize on the AsyncTask thread, and block
-        try {
-            new GuardedAsyncTask<Void, Void>(getReactApplicationContext()) {
-                @Override
-                protected void doInBackgroundGuarded(Void... params) {
-                    for (int i = 0; i < mClients.size(); i++) {
-                        try {
-                            mClients.valueAt(i).close();
-                        } catch (IOException e) {
-                            FLog.e(TAG, "exception when shutting down", e);
-                        }
+        executorService.execute(new Thread(new Runnable() {
+            @Override
+            public void run() {
+                for (int i = 0; i < mClients.size(); i++) {
+                    UdpSocketClient client = mClients.valueAt(i);
+                    client.close();
+                    if (mMulticastLock != null && mMulticastLock.isHeld() && client.isMulticast()) {
+                        // drop the multi-cast lock if this is a multi-cast client
+                        mMulticastLock.release();
                     }
-                    mClients.clear();
                 }
-            }.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR).get();
-        } catch (InterruptedException ioe) {
-            FLog.e(TAG, "onCatalystInstanceDestroy", ioe);
-        } catch (ExecutionException ee) {
-            FLog.e(TAG, "onCatalystInstanceDestroy", ee);
-        }
+                mClients.clear();
+            }
+        }));
     }
 
     /**
@@ -112,23 +96,21 @@ public final class UdpSockets extends ReactContextBaseJavaModule
             FLog.e(TAG, "createSocket called twice with the same id.");
             return;
         }
-
-        UdpSocketClient.Builder builder = new UdpSocketClient.Builder(UdpSockets.this, UdpSockets.this);
-        mClients.put(cId, builder.build());
+        mClients.put(cId, new UdpSocketClient(this, this));
     }
 
     /**
      * Binds to a given port and address, and begins listening for data.
      */
     @ReactMethod
-    public void bind(final Integer cId, final Integer port, final @Nullable String address,
+    public void bind(final Integer cId, final Integer port, final @Nullable String address, final @Nullable ReadableMap options,
                      final Callback callback) {
-        new GuardedAsyncTask<Void, Void>(getReactApplicationContext()) {
+        executorService.execute(new Thread(new Runnable() {
             @Override
-            protected void doInBackgroundGuarded(Void... params) {
+            public void run() {
                 UdpSocketClient client = findClient(cId, callback);
                 if (client == null) {
-                        return;
+                    return;
                 }
 
                 try {
@@ -139,28 +121,23 @@ public final class UdpSockets extends ReactContextBaseJavaModule
                     result.putInt("port", port);
 
                     callback.invoke(null, result);
-                } catch (SocketException se) {
+                } catch (Exception e) {
                     // Socket is already bound or a problem occurred during binding
-                    callback.invoke(UdpErrorUtil.getError(null, se.getMessage()));
-                } catch (IllegalArgumentException iae) {
-                    // SocketAddress is not supported
-                    callback.invoke(UdpErrorUtil.getError(null, iae.getMessage()));
-                } catch (IOException ioe) {
-                    // an exception occurred
-                    callback.invoke(UdpErrorUtil.getError(null, ioe.getMessage()));
+                    callback.invoke(UdpErrorUtil.getError(null, e.getMessage()));
                 }
             }
-        }.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
+        }));
     }
 
     /**
      * Joins a multi-cast group
      */
+    @SuppressWarnings("unused")
     @ReactMethod
     public void addMembership(final Integer cId, final String multicastAddress) {
-        new GuardedAsyncTask<Void, Void>(getReactApplicationContext()) {
+        executorService.execute(new Thread(new Runnable() {
             @Override
-            protected void doInBackgroundGuarded(Void... params) {
+            public void run() {
                 UdpSocketClient client = findClient(cId, null);
                 if (client == null) {
                     return;
@@ -168,13 +145,13 @@ public final class UdpSockets extends ReactContextBaseJavaModule
 
                 if (mMulticastLock == null) {
                     WifiManager wifiMgr = (WifiManager) getReactApplicationContext()
-                        .getApplicationContext()
-                        .getSystemService(Context.WIFI_SERVICE);
+                            .getApplicationContext()
+                            .getSystemService(Context.WIFI_SERVICE);
                     mMulticastLock = wifiMgr.createMulticastLock("react-native-udp");
                     mMulticastLock.setReferenceCounted(true);
                 }
 
-               try {
+                try {
                     mMulticastLock.acquire();
                     client.addMembership(multicastAddress);
                 } catch (IllegalStateException ise) {
@@ -197,7 +174,7 @@ public final class UdpSockets extends ReactContextBaseJavaModule
                     FLog.e(TAG, "addMembership", ioe);
                 }
             }
-        }.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
+        }));
     }
 
     /**
@@ -205,9 +182,9 @@ public final class UdpSockets extends ReactContextBaseJavaModule
      */
     @ReactMethod
     public void dropMembership(final Integer cId, final String multicastAddress) {
-        new GuardedAsyncTask<Void, Void>(getReactApplicationContext()) {
+        executorService.execute(new Thread(new Runnable() {
             @Override
-            protected void doInBackgroundGuarded(Void... params) {
+            public void run() {
                 UdpSocketClient client = findClient(cId, null);
                 if (client == null) {
                     return;
@@ -224,7 +201,7 @@ public final class UdpSockets extends ReactContextBaseJavaModule
                     }
                 }
             }
-        }.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
+        }));
     }
 
     /**
@@ -233,9 +210,9 @@ public final class UdpSockets extends ReactContextBaseJavaModule
     @ReactMethod
     public void send(final Integer cId, final String base64String,
                      final Integer port, final String address, final Callback callback) {
-        new GuardedAsyncTask<Void, Void>(getReactApplicationContext()) {
+        executorService.execute(new Thread(new Runnable() {
             @Override
-            protected void doInBackgroundGuarded(Void... params) {
+            public void run() {
                 UdpSocketClient client = findClient(cId, callback);
                 if (client == null) {
                     return;
@@ -245,14 +222,14 @@ public final class UdpSockets extends ReactContextBaseJavaModule
                     client.send(base64String, port, address, callback);
                 } catch (IllegalStateException ise) {
                     callback.invoke(UdpErrorUtil.getError(null, ise.getMessage()));
-                }catch (UnknownHostException uhe) {
+                } catch (UnknownHostException uhe) {
                     callback.invoke(UdpErrorUtil.getError(null, uhe.getMessage()));
                 } catch (IOException ioe) {
                     // an exception occurred
                     callback.invoke(UdpErrorUtil.getError(null, ioe.getMessage()));
                 }
             }
-        }.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
+        }));
     }
 
     /**
@@ -260,9 +237,9 @@ public final class UdpSockets extends ReactContextBaseJavaModule
      */
     @ReactMethod
     public void close(final Integer cId, final Callback callback) {
-        new GuardedAsyncTask<Void, Void>(getReactApplicationContext()) {
+        executorService.execute(new Thread(new Runnable() {
             @Override
-            protected void doInBackgroundGuarded(Void... params) {
+            public void run() {
                 UdpSocketClient client = findClient(cId, callback);
                 if (client == null) {
                     return;
@@ -272,17 +249,11 @@ public final class UdpSockets extends ReactContextBaseJavaModule
                     // drop the multi-cast lock if this is a multi-cast client
                     mMulticastLock.release();
                 }
-
-                try {
-                    client.close();
-                    callback.invoke();
-                } catch (IOException ioe) {
-                    callback.invoke(UdpErrorUtil.getError(null, ioe.getMessage()));
-                }
-
+                client.close();
+                callback.invoke();
                 mClients.remove(cId);
             }
-        }.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
+        }));
     }
 
     /**
@@ -290,9 +261,9 @@ public final class UdpSockets extends ReactContextBaseJavaModule
      */
     @ReactMethod
     public void setBroadcast(final Integer cId, final Boolean flag, final Callback callback) {
-        new GuardedAsyncTask<Void, Void>(getReactApplicationContext()) {
+        executorService.execute(new Thread(new Runnable() {
             @Override
-            protected void doInBackgroundGuarded(Void... params) {
+            public void run() {
                 UdpSocketClient client = findClient(cId, callback);
                 if (client == null) {
                     return;
@@ -305,7 +276,7 @@ public final class UdpSockets extends ReactContextBaseJavaModule
                     callback.invoke(UdpErrorUtil.getError(null, e.getMessage()));
                 }
             }
-        }.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
+        }));
     }
 
     /**
@@ -313,11 +284,12 @@ public final class UdpSockets extends ReactContextBaseJavaModule
      */
     @Override
     public void didReceiveData(final UdpSocketClient socket, final String data, final String host, final int port) {
-        new GuardedAsyncTask<Void, Void>(getReactApplicationContext()) {
+        final long ts = System.currentTimeMillis();
+        executorService.execute(new Thread(new Runnable() {
             @Override
-            protected void doInBackgroundGuarded(Void... params) {
+            public void run() {
                 int clientID = -1;
-                for(int i = 0; i < mClients.size(); i++) {
+                for (int i = 0; i < mClients.size(); i++) {
                     clientID = mClients.keyAt(i);
                     // get the object by the key.
                     if (socket.equals(mClients.get(clientID))) {
@@ -333,13 +305,15 @@ public final class UdpSockets extends ReactContextBaseJavaModule
                 eventParams.putString("data", data);
                 eventParams.putString("address", host);
                 eventParams.putInt("port", port);
+                // Use string for ts since it's 64 bits and putInt is only 32
+                eventParams.putString("ts", Long.toString(ts));
 
                 ReactContext reactContext = UdpSockets.this.getReactApplicationContext();
                 reactContext
                         .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
                         .emit("udp-" + clientID + "-data", eventParams);
             }
-        }.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
+        }));
     }
 
     /**
